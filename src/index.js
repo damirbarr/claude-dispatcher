@@ -120,38 +120,36 @@ async function spawnAgent(prompt, reply) {
   return name;
 }
 
-// Branch = spawn a NEW agent seeded with context from the parent agent
+// Branch = fork a claude session: full conversation history, new session ID
 async function branchAgent(parentName, reply) {
-  const parent = store.get(state, parentName);
+  var parent = store.get(state, parentName);
   if (!parent) return reply('No session <code>' + parentName + '</code>.');
 
-  // Grab parent's recent output for context
-  var contextLines = '';
-  if (tmux.windowExists(parentName)) {
-    const pane = safeCapture(parentName);
-    if (pane) {
-      contextLines = pane.split('\n').filter(function(l) { return l.trim(); }).slice(-30).join('\n');
-    }
+  // Extract session ID from the stored URL (e.g. session_01AKzp7d7PKRJLXk2NMaGcwr)
+  var sessionId = null;
+  if (parent.url) {
+    var m = parent.url.match(/session_[a-zA-Z0-9_-]+/);
+    if (m) sessionId = m[0];
   }
 
-  var branchPrompt = 'Continue the work from ' + parentName + '.';
-  if (parent.prompt) {
-    branchPrompt += ' Original task: ' + parent.prompt.slice(0, 500);
-  }
-  if (contextLines) {
-    branchPrompt += ' Here is the recent output from the parent session for context: ' + contextLines.slice(0, 1500);
+  if (!sessionId) {
+    return reply('No session ID stored for <code>' + parentName + '</code>. Cannot fork.');
   }
 
-  await reply('Branching from <b>' + parentName + '</b>...');
+  await reply('Forking <b>' + parentName + '</b>...');
 
   var childName = store.nextName(state);
   store.save(state);
-  console.log('[dispatch] branch', childName, 'from', parentName);
+  console.log('[dispatch] fork', childName, 'from', parentName, 'session=' + sessionId);
+
+  // Kill old window so claude can resume the session file
+  tmux.killWindow(parentName);
 
   tmux.ensureSession();
+  // --resume <id> loads the full conversation, --fork-session gives it a new ID
   tmux.newWindow(childName, {
     cwd: AGENT_CWD,
-    command: CLAUDE_BIN + ' --dangerously-skip-permissions',
+    command: CLAUDE_BIN + ' --dangerously-skip-permissions --resume ' + sessionId + ' --fork-session',
   });
 
   await waitForReady(childName, +READY_TIMEOUT_MS);
@@ -161,24 +159,21 @@ async function branchAgent(parentName, reply) {
 
   var url = await waitForUrl(childName, +URL_TIMEOUT_MS);
 
-  // Send the branch prompt
-  var oneLinePrompt = branchPrompt.replace(/\r?\n/g, ' ').trim();
-  await sleep(400);
-  tmux.sendText(childName, oneLinePrompt);
-  tmux.sendEnter(childName);
-
   store.add(state, {
     name: childName,
     url: url,
-    prompt: branchPrompt.slice(0, 2000),
+    prompt: '(forked from ' + parentName + ') ' + (parent.prompt || '').slice(0, 1500),
     createdAt: new Date().toISOString(),
     parentAgent: parentName,
   });
 
+  // Remove old parent from tracked sessions (its window is gone)
+  store.remove(state, parentName);
+
   if (url) {
-    await reply('<b>' + childName + '</b> (branched from ' + parentName + ')\n' + url);
+    await reply('<b>' + childName + '</b> (forked from ' + parentName + ')\n' + url);
   } else {
-    await reply('<b>' + childName + '</b> branched from ' + parentName + ', no URL captured.\n<code>tmux attach -t ' + tmux.SESSION + '</code>');
+    await reply('<b>' + childName + '</b> forked, no URL.\n<code>tmux attach -t ' + tmux.SESSION + '</code>');
   }
 }
 
@@ -247,7 +242,7 @@ function buildBot() {
     { command: 'list', description: 'Show all sessions with links and prompts' },
     { command: 'kill', description: 'Kill a session: /kill agent-N' },
     { command: 'killall', description: 'Kill ALL sessions' },
-    { command: 'branch', description: 'Fork an agent: /branch agent-N' },
+    { command: 'branch', description: 'Fork session with full history: /branch agent-N' },
     { command: 'peek', description: 'Last output: /peek agent-N' },
     { command: 'status', description: 'System status' },
     { command: 'help', description: 'Show commands' },
@@ -265,7 +260,7 @@ function buildBot() {
       + 'Send any text to spawn a Claude Code agent (yolo mode).\n'
       + 'Agent CWD: <code>' + AGENT_CWD + '</code>\n\n'
       + '/list - sessions with clickable links\n'
-      + '/branch agent-N - fork into a new agent with context\n'
+      + '/branch agent-N - fork with full history\n'
       + '/kill agent-N | /killall\n'
       + '/peek agent-N - last output\n'
       + '/status - system info',
@@ -277,7 +272,7 @@ function buildBot() {
     return ctx.reply(
       'Send any text = spawn new agent\n\n'
       + '/list - all sessions + links + prompts\n'
-      + '/branch agent-N - fork: new agent with parent context\n'
+      + '/branch agent-N - fork with full history\n'
       + '/kill agent-N - kill one\n'
       + '/killall - kill all\n'
       + '/peek [agent-N] - last 15 lines (default: latest)\n'
