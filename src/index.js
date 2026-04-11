@@ -66,6 +66,22 @@ async function waitForUrl(name, ms) {
   return null;
 }
 
+// Wait for a NEW url (different from oldUrl) to appear
+async function waitForNewUrl(name, oldUrl, ms) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) {
+    const p = safeCapture(name);
+    if (p) {
+      // Find ALL urls, pick one that differs from oldUrl
+      const matches = p.match(new RegExp(RC_URL_RE.source, 'g')) || [];
+      const fresh = matches.find(u => u !== oldUrl);
+      if (fresh) return fresh;
+    }
+    await sleep(500);
+  }
+  return null;
+}
+
 async function spawnAgent(prompt, reply) {
   const name = store.nextName(state);
   store.save(state);
@@ -93,6 +109,7 @@ async function spawnAgent(prompt, reply) {
 
   store.add(state, {
     name, url, prompt: prompt.slice(0, 2000), createdAt: new Date().toISOString(),
+    parentAgent: null,
   });
 
   if (url) {
@@ -100,47 +117,90 @@ async function spawnAgent(prompt, reply) {
   } else {
     await reply('<b>' + name + '</b> spawned, no URL captured.\n<code>tmux attach -t ' + tmux.SESSION + '</code>');
   }
+  return name;
 }
 
-// Re-run /remote-control on an existing agent to get a fresh URL
-async function branchAgent(name, reply) {
-  const s = store.get(state, name);
-  if (!s) return reply('No session <code>' + name + '</code>.');
-  if (!tmux.windowExists(name)) return reply('<code>' + name + '</code> tmux window is gone.');
+// Branch = spawn a NEW agent seeded with context from the parent agent
+async function branchAgent(parentName, reply) {
+  const parent = store.get(state, parentName);
+  if (!parent) return reply('No session <code>' + parentName + '</code>.');
 
-  await reply('Branching <b>' + name + '</b>...');
+  // Grab parent's recent output for context
+  var contextLines = '';
+  if (tmux.windowExists(parentName)) {
+    const pane = safeCapture(parentName);
+    if (pane) {
+      contextLines = pane.split('\n').filter(function(l) { return l.trim(); }).slice(-30).join('\n');
+    }
+  }
 
-  tmux.sendText(name, '/remote-control');
-  tmux.sendEnter(name);
+  var branchPrompt = 'Continue the work from ' + parentName + '.';
+  if (parent.prompt) {
+    branchPrompt += ' Original task: ' + parent.prompt.slice(0, 500);
+  }
+  if (contextLines) {
+    branchPrompt += ' Here is the recent output from the parent session for context: ' + contextLines.slice(0, 1500);
+  }
 
-  const url = await waitForUrl(name, +URL_TIMEOUT_MS);
+  await reply('Branching from <b>' + parentName + '</b>...');
+
+  var childName = store.nextName(state);
+  store.save(state);
+  console.log('[dispatch] branch', childName, 'from', parentName);
+
+  tmux.ensureSession();
+  tmux.newWindow(childName, {
+    cwd: AGENT_CWD,
+    command: CLAUDE_BIN + ' --dangerously-skip-permissions',
+  });
+
+  await waitForReady(childName, +READY_TIMEOUT_MS);
+
+  tmux.sendText(childName, '/remote-control');
+  tmux.sendEnter(childName);
+
+  var url = await waitForUrl(childName, +URL_TIMEOUT_MS);
+
+  // Send the branch prompt
+  var oneLinePrompt = branchPrompt.replace(/\r?\n/g, ' ').trim();
+  await sleep(400);
+  tmux.sendText(childName, oneLinePrompt);
+  tmux.sendEnter(childName);
+
+  store.add(state, {
+    name: childName,
+    url: url,
+    prompt: branchPrompt.slice(0, 2000),
+    createdAt: new Date().toISOString(),
+    parentAgent: parentName,
+  });
 
   if (url) {
-    store.update(state, name, { url });
-    await reply('<b>' + name + '</b> new link:\n' + url);
+    await reply('<b>' + childName + '</b> (branched from ' + parentName + ')\n' + url);
   } else {
-    await reply('<b>' + name + '</b> no URL captured. Try <code>/peek ' + name + '</code>.');
+    await reply('<b>' + childName + '</b> branched from ' + parentName + ', no URL captured.\n<code>tmux attach -t ' + tmux.SESSION + '</code>');
   }
 }
 
 function listSessions() {
-  const all = store.list(state);
+  var all = store.list(state);
   if (!all.length) return 'No active sessions.';
-  const wins = new Set(tmux.listWindows());
-  return all.map(s => {
-    const alive = wins.has(s.name);
-    const status = alive ? '' : ' [gone]';
-    const age = timeSince(s.createdAt);
-    const promptPreview = s.prompt ? s.prompt.slice(0, 60).replace(/</g, '&lt;') : '';
-    const urlLine = s.url ? '\n  ' + s.url : '\n  <i>no URL</i>';
-    return '<b>' + s.name + '</b> (' + age + ')' + status
+  var wins = new Set(tmux.listWindows());
+  return all.map(function(s) {
+    var alive = wins.has(s.name);
+    var status = alive ? '' : ' [gone]';
+    var age = timeSince(s.createdAt);
+    var promptPreview = s.prompt ? s.prompt.slice(0, 60).replace(/</g, '&lt;') : '';
+    var parent = s.parentAgent ? ' (from ' + s.parentAgent + ')' : '';
+    var urlLine = s.url ? '\n  ' + s.url : '\n  <i>no URL</i>';
+    return '<b>' + s.name + '</b> (' + age + ')' + parent + status
       + '\n  <i>' + promptPreview + (s.prompt && s.prompt.length > 60 ? '...' : '') + '</i>'
       + urlLine;
   }).join('\n\n');
 }
 
 function timeSince(iso) {
-  const ms = Date.now() - new Date(iso).getTime();
+  var ms = Date.now() - new Date(iso).getTime();
   if (ms < 60000) return Math.floor(ms / 1000) + 's';
   if (ms < 3600000) return Math.floor(ms / 60000) + 'm';
   if (ms < 86400000) return Math.floor(ms / 3600000) + 'h';
@@ -155,12 +215,12 @@ function killSession(name) {
 }
 
 function killAll() {
-  const all = store.list(state);
+  var all = store.list(state);
   if (!all.length) return 'No sessions to kill.';
-  let count = 0;
-  for (const s of all) {
-    tmux.killWindow(s.name);
-    store.remove(state, s.name);
+  var count = 0;
+  for (var i = 0; i < all.length; i++) {
+    tmux.killWindow(all[i].name);
+    store.remove(state, all[i].name);
     count++;
   }
   return 'Killed <b>' + count + '</b> session(s).';
@@ -168,9 +228,9 @@ function killAll() {
 
 function peekSession(name) {
   if (!state.sessions[name]) return 'No session <code>' + name + '</code>.';
-  const p = safeCapture(name);
+  var p = safeCapture(name);
   if (!p) return '<code>' + name + '</code> tmux window not found.';
-  const lines = p.split('\n').filter(l => l.trim()).slice(-15);
+  var lines = p.split('\n').filter(function(l) { return l.trim(); }).slice(-15);
   return '<b>' + name + '</b> last output:\n<pre>' + escapeHtml(lines.join('\n')) + '</pre>';
 }
 
@@ -178,7 +238,7 @@ function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-let bot;
+var bot;
 
 function buildBot() {
   bot = new Telegraf(TELEGRAM_BOT_TOKEN);
@@ -187,83 +247,95 @@ function buildBot() {
     { command: 'list', description: 'Show all sessions with links and prompts' },
     { command: 'kill', description: 'Kill a session: /kill agent-N' },
     { command: 'killall', description: 'Kill ALL sessions' },
-    { command: 'branch', description: 'New remote-control link: /branch agent-N' },
+    { command: 'branch', description: 'Fork an agent: /branch agent-N' },
     { command: 'peek', description: 'Last output: /peek agent-N' },
     { command: 'status', description: 'System status' },
     { command: 'help', description: 'Show commands' },
-  ]).catch(e => console.warn('setMyCommands failed:', e.message));
+  ]).catch(function(e) { console.warn('setMyCommands failed:', e.message); });
 
-  bot.use((ctx, next) => {
+  bot.use(function(ctx, next) {
     if (!ctx.chat) return;
     if (!ALLOWED_CHATS.has(String(ctx.chat.id))) return;
     return next();
   });
 
-  bot.command('start', ctx => ctx.reply(
-    'Claude Dispatcher\n\n'
-    + 'Send any text to spawn a Claude Code agent (yolo mode).\n'
-    + 'Agent CWD: <code>' + AGENT_CWD + '</code>\n\n'
-    + '/list - sessions with clickable links\n'
-    + '/branch agent-N - get a new remote-control link\n'
-    + '/kill agent-N | /killall\n'
-    + '/peek agent-N - last output\n'
-    + '/status - system info',
-    { parse_mode: 'HTML' }
-  ));
+  bot.command('start', function(ctx) {
+    return ctx.reply(
+      'Claude Dispatcher\n\n'
+      + 'Send any text to spawn a Claude Code agent (yolo mode).\n'
+      + 'Agent CWD: <code>' + AGENT_CWD + '</code>\n\n'
+      + '/list - sessions with clickable links\n'
+      + '/branch agent-N - fork into a new agent with context\n'
+      + '/kill agent-N | /killall\n'
+      + '/peek agent-N - last output\n'
+      + '/status - system info',
+      { parse_mode: 'HTML' }
+    );
+  });
 
-  bot.command('help', ctx => ctx.reply(
-    'Send any text = spawn new agent\n\n'
-    + '/list - all sessions + links + prompts\n'
-    + '/branch agent-N - new remote-control link\n'
-    + '/kill agent-N - kill one\n'
-    + '/killall - kill all\n'
-    + '/peek [agent-N] - last 15 lines (default: latest)\n'
-    + '/status - uptime, tmux, config',
-    { parse_mode: 'HTML' }
-  ));
+  bot.command('help', function(ctx) {
+    return ctx.reply(
+      'Send any text = spawn new agent\n\n'
+      + '/list - all sessions + links + prompts\n'
+      + '/branch agent-N - fork: new agent with parent context\n'
+      + '/kill agent-N - kill one\n'
+      + '/killall - kill all\n'
+      + '/peek [agent-N] - last 15 lines (default: latest)\n'
+      + '/status - uptime, tmux, config',
+      { parse_mode: 'HTML' }
+    );
+  });
 
-  bot.command('list', ctx => ctx.reply(listSessions(), {
-    parse_mode: 'HTML',
-    link_preview_options: { is_disabled: true },
-  }));
+  bot.command('list', function(ctx) {
+    return ctx.reply(listSessions(), {
+      parse_mode: 'HTML',
+      link_preview_options: { is_disabled: true },
+    });
+  });
 
-  bot.command('kill', ctx => {
-    const args = ctx.message.text.split(/\s+/).slice(1);
+  bot.command('kill', function(ctx) {
+    var args = ctx.message.text.split(/\s+/).slice(1);
     if (!args.length) return ctx.reply('Usage: /kill agent-N');
     return ctx.reply(killSession(args[0]), { parse_mode: 'HTML' });
   });
 
-  bot.command('killall', ctx => ctx.reply(killAll(), { parse_mode: 'HTML' }));
-
-  bot.command('branch', async ctx => {
-    const args = ctx.message.text.split(/\s+/).slice(1);
-    if (!args.length) {
-      const all = store.list(state);
-      if (!all.length) return ctx.reply('No sessions.');
-      // Branch the most recent
-      const latest = all[all.length - 1].name;
-      return branchAgent(latest, msg => ctx.reply(msg, { parse_mode: 'HTML' }));
-    }
-    return branchAgent(args[0], msg => ctx.reply(msg, { parse_mode: 'HTML' }));
+  bot.command('killall', function(ctx) {
+    return ctx.reply(killAll(), { parse_mode: 'HTML' });
   });
 
-  bot.command('peek', ctx => {
-    const args = ctx.message.text.split(/\s+/).slice(1);
+  bot.command('branch', async function(ctx) {
+    var args = ctx.message.text.split(/\s+/).slice(1);
+    var target;
     if (!args.length) {
-      const all = store.list(state);
+      var all = store.list(state);
+      if (!all.length) return ctx.reply('No sessions.');
+      target = all[all.length - 1].name;
+    } else {
+      target = args[0];
+    }
+    var reply = function(msg) {
+      return ctx.reply(msg, { parse_mode: 'HTML' });
+    };
+    return branchAgent(target, reply);
+  });
+
+  bot.command('peek', function(ctx) {
+    var args = ctx.message.text.split(/\s+/).slice(1);
+    if (!args.length) {
+      var all = store.list(state);
       if (!all.length) return ctx.reply('No sessions.');
       return ctx.reply(peekSession(all[all.length - 1].name), { parse_mode: 'HTML' });
     }
     return ctx.reply(peekSession(args[0]), { parse_mode: 'HTML' });
   });
 
-  bot.command('status', async ctx => {
-    const sessions = store.list(state);
-    const wins = tmux.listWindows();
-    const uptime = process.uptime();
-    const h = Math.floor(uptime / 3600);
-    const m = Math.floor((uptime % 3600) / 60);
-    const lines = [
+  bot.command('status', function(ctx) {
+    var sessions = store.list(state);
+    var wins = tmux.listWindows();
+    var uptime = process.uptime();
+    var h = Math.floor(uptime / 3600);
+    var m = Math.floor((uptime % 3600) / 60);
+    var lines = [
       '<b>Status</b>',
       'Bot uptime: ' + h + 'h ' + m + 'm',
       'Tracked sessions: ' + sessions.length,
@@ -274,27 +346,31 @@ function buildBot() {
     return ctx.reply(lines.join('\n'), { parse_mode: 'HTML' });
   });
 
-  bot.on('text', async ctx => {
-    const text = ctx.message.text.trim();
+  bot.on('text', async function(ctx) {
+    var text = ctx.message.text.trim();
     if (text.startsWith('/')) return;
 
-    const reply = msg => ctx.reply(msg, {
-      parse_mode: 'HTML',
-      reply_parameters: { message_id: ctx.message.message_id },
-    }).catch(() => ctx.reply(msg.replace(/<[^>]+>/g, ''), {
-      reply_parameters: { message_id: ctx.message.message_id },
-    }));
+    var reply = function(msg) {
+      return ctx.reply(msg, {
+        parse_mode: 'HTML',
+        reply_parameters: { message_id: ctx.message.message_id },
+      }).catch(function() {
+        return ctx.reply(msg.replace(/<[^>]+>/g, ''), {
+          reply_parameters: { message_id: ctx.message.message_id },
+        });
+      });
+    };
 
     try {
       await reply('Spawning: <i>' + escapeHtml(text.slice(0, 200)) + '</i>');
       await spawnAgent(text, reply);
     } catch (e) {
       console.error('[handler]', e);
-      try { await reply('Error: ' + escapeHtml(e.message)); } catch {}
+      try { await reply('Error: ' + escapeHtml(e.message)); } catch (e2) {}
     }
   });
 
-  bot.catch(e => console.error('[telegraf]', e));
+  bot.catch(function(e) { console.error('[telegraf]', e); });
 }
 
 async function main() {
@@ -304,6 +380,6 @@ async function main() {
   console.log('Claude dispatcher running (chats=' + [...ALLOWED_CHATS].join(',') + ')');
 }
 
-process.on('SIGINT', () => { bot?.stop('SIGINT'); process.exit(0); });
-process.on('SIGTERM', () => { bot?.stop('SIGTERM'); process.exit(0); });
-main().catch(e => { console.error('Fatal:', e); process.exit(1); });
+process.on('SIGINT', function() { if (bot) bot.stop('SIGINT'); process.exit(0); });
+process.on('SIGTERM', function() { if (bot) bot.stop('SIGTERM'); process.exit(0); });
+main().catch(function(e) { console.error('Fatal:', e); process.exit(1); });
