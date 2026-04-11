@@ -1,0 +1,20 @@
+{
+  "name": "claude-dispatcher",
+  "version": "1.0.0",
+  "description": "Slack-driven dispatcher that spawns Claude Code sessions in tmux windows and reports back remote-control URLs",
+  "private": true,
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "test:tmux": "node scripts/test-tmux.js",
+    "test:sessions": "node scripts/test-sessions.js",
+    "test": "npm run test:sessions && npm run test:tmux"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "telegraf": "^4.16.3"
+  }
+}

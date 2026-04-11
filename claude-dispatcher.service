@@ -1,0 +1,21 @@
+[Unit]
+Description=Claude Code Telegram Dispatcher
+Documentation=file:%h/claude-dispatcher/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/claude-dispatcher
+# Use a login shell so nvm-installed node is on PATH.
+# If you don't use nvm, change this to: ExecStart=/usr/bin/node %h/claude-dispatcher/src/index.js
+ExecStart=/usr/bin/env node %h/claude-dispatcher/src/index.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# Read env from the .env file too (dotenv loads it, but this is a safety net)
+EnvironmentFile=-%h/.claude-sessions/.env
+
+[Install]
+WantedBy=default.target
