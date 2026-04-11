@@ -221,8 +221,24 @@ function peekSession(name) {
   if (!state.sessions[name]) return 'No session <code>' + name + '</code>.';
   var p = safeCapture(name);
   if (!p) return '<code>' + name + '</code> tmux window not found.';
-  var lines = p.split('\n').filter(function(l) { return l.trim(); }).slice(-15);
-  return '<b>' + name + '</b> last output:\n<pre>' + escapeHtml(lines.join('\n')) + '</pre>';
+  // Filter out TUI chrome: box-drawing, status bars, empty lines, prompts
+  var lines = p.split('\n').filter(function(l) {
+    var t = l.trim();
+    if (!t) return false;
+    // Skip box-drawing lines (TUI borders)
+    if (/^[\u2500-\u257f\u2580-\u259f\s|]+$/.test(t)) return false;
+    // Skip Claude TUI chrome
+    if (t.match(/^[\u256d\u256e\u2570\u256f\u2502\u2500\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2551\u2550]/)) return false;
+    // Skip status bar items
+    if (t.match(/bypass permissions|shift\+tab|Remote Control active/i)) return false;
+    // Skip empty prompt lines
+    if (t === '>' || t === '\u276f') return false;
+    return true;
+  }).slice(-20);
+  if (!lines.length) return '<b>' + name + '</b>: no readable output.';
+  // Truncate long lines
+  lines = lines.map(function(l) { return l.length > 200 ? l.slice(0, 200) + '...' : l; });
+  return '<b>' + name + '</b>:\n<pre>' + escapeHtml(lines.join('\n')) + '</pre>';
 }
 
 function escapeHtml(s) {
