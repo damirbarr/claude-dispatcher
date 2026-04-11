@@ -142,8 +142,6 @@ async function branchAgent(parentName, reply) {
   store.save(state);
   console.log('[dispatch] fork', childName, 'from', parentName, 'session=' + sessionId);
 
-  // Kill old window so claude can resume the session file
-  tmux.killWindow(parentName);
 
   tmux.ensureSession();
   // --resume <id> loads the full conversation, --fork-session gives it a new ID
@@ -167,8 +165,6 @@ async function branchAgent(parentName, reply) {
     parentAgent: parentName,
   });
 
-  // Remove old parent from tracked sessions (its window is gone)
-  store.remove(state, parentName);
 
   if (url) {
     await reply('<b>' + childName + '</b> (forked from ' + parentName + ')\n' + url);
