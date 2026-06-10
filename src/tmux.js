@@ -36,7 +36,11 @@ function newWindow(name, opts = {}) {
 }
 
 function windowExists(name) {
-  return runQuiet(['has-session', '-t', `${SESSION}:${name}`]);
+  try {
+    return listWindows().includes(name);
+  } catch {
+    return false;
+  }
 }
 
 function sendText(name, text) {
